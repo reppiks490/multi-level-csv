@@ -1,0 +1,121 @@
+name: nq-history-scan
+
+on:
+  push:
+    branches:
+      - chatgpt/nq-history-scan-20261001
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan NQ CSV members in ZIP archives
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, hashlib, io, json, math, os, statistics, zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+
+          def safe_float(x):
+              try: return float(x)
+              except Exception: return None
+
+          out={"schema":"icarus-nq-archive-scan-v1","repository":"reppiks490/multi-level-csv","members":[]}
+          for zname in sorted(fn for fn in os.listdir(".") if fn.lower().endswith(".zip")):
+              try:
+                  zf=zipfile.ZipFile(zname)
+              except Exception as e:
+                  out.setdefault("archive_errors",[]).append({"archive":zname,"error":repr(e)})
+                  continue
+              for info in zf.infolist():
+                  base=os.path.basename(info.filename)
+                  if info.is_dir() or not base.lower().endswith(".csv") or base.startswith("._"):
+                      continue
+                  up=base.upper()
+                  if "NQ1!" not in up and "NQ1" not in up and "NASDAQ" not in up:
+                      continue
+                  rec={"archive":zname,"member":info.filename,"bytes":info.file_size}
+                  try:
+                      raw=zf.read(info)
+                      rec["sha256"]=hashlib.sha256(raw).hexdigest()
+                      text=raw.decode("utf-8-sig")
+                      reader=csv.reader(io.StringIO(text,newline=""))
+                      header=next(reader)
+                      rec["headers"]=header
+                      tix=next((i for i,h in enumerate(header) if str(h).strip().lower() in ("time","ts","timestamp","date and time","datetime")),None)
+                      oix=next((i for i,h in enumerate(header) if str(h).strip().lower()=="open"),None)
+                      hix=next((i for i,h in enumerate(header) if str(h).strip().lower()=="high"),None)
+                      lix=next((i for i,h in enumerate(header) if str(h).strip().lower()=="low"),None)
+                      cix=next((i for i,h in enumerate(header) if str(h).strip().lower()=="close"),None)
+                      ts=[]; rows=0; samples=[]; byday=defaultdict(list)
+                      for row in reader:
+                          if not row: continue
+                          rows+=1
+                          if tix is None or tix>=len(row): continue
+                          t=safe_float(row[tix])
+                          if t is None: continue
+                          # Normalize millisecond epochs if present.
+                          if t>10_000_000_000: t/=1000.0
+                          ts.append(t)
+                          if len(samples)<3:
+                              samples.append({
+                                  "t":t,
+                                  "o":safe_float(row[oix]) if oix is not None and oix<len(row) else None,
+                                  "h":safe_float(row[hix]) if hix is not None and hix<len(row) else None,
+                                  "l":safe_float(row[lix]) if lix is not None and lix<len(row) else None,
+                                  "c":safe_float(row[cix]) if cix is not None and cix<len(row) else None,
+                              })
+                          try:
+                              d=datetime.fromtimestamp(t,timezone.utc).date().isoformat()
+                              byday[d].append(t)
+                          except Exception:
+                              pass
+                      rec["rows"]=rows
+                      if ts:
+                          rec["first_ts"]=min(ts); rec["last_ts"]=max(ts)
+                          rec["first_utc"]=datetime.fromtimestamp(rec["first_ts"],timezone.utc).isoformat()
+                          rec["last_utc"]=datetime.fromtimestamp(rec["last_ts"],timezone.utc).isoformat()
+                          diffs=[b-a for a,b in zip(ts,ts[1:]) if 0 < b-a <= 86400*7]
+                          if diffs:
+                              rounded=[round(x,3) for x in diffs]
+                              mode,count=Counter(rounded).most_common(1)[0]
+                              rec["mode_delta_seconds"]=mode
+                              rec["mode_delta_fraction"]=count/len(rounded)
+                              rec["median_delta_seconds"]=statistics.median(diffs)
+                          daily=[]
+                          for d,vals in byday.items():
+                              if len(vals)>=2:
+                                  daily.append({"date":d,"count":len(vals),"span_seconds":max(vals)-min(vals),
+                                                "first_utc_minute":datetime.fromtimestamp(min(vals),timezone.utc).strftime("%H:%M"),
+                                                "last_utc_minute":datetime.fromtimestamp(max(vals),timezone.utc).strftime("%H:%M")})
+                          if daily:
+                              counts=[x["count"] for x in daily]
+                              spans=[x["span_seconds"] for x in daily]
+                              rec["daily_count_median"]=statistics.median(counts)
+                              rec["daily_span_hours_median"]=statistics.median(spans)/3600.0
+                              rec["daily_examples"]=daily[:2]+daily[-2:]
+                      rec["samples"]=samples
+                      rec["parse_status"]="ok"
+                  except Exception as e:
+                      rec["parse_status"]="error"; rec["error"]=repr(e)
+                  out["members"].append(rec)
+          out["members"].sort(key=lambda x:(x.get("first_ts",10**30),x["archive"],x["member"]))
+          with open("nq_history_scan.json","w",encoding="utf-8") as f:
+              json.dump(out,f,indent=2)
+          print(json.dumps({"members":len(out["members"]),"earliest":[
+              {"archive":x["archive"],"member":x["member"],"first_utc":x.get("first_utc"),"last_utc":x.get("last_utc"),
+               "rows":x.get("rows"),"mode_delta_seconds":x.get("mode_delta_seconds")}
+              for x in out["members"][:20]
+          ]},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nq-history-scan
+          path: nq_history_scan.json
+          if-no-files-found: error
